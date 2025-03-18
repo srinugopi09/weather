@@ -1,0 +1,13 @@
+{
+    "mcpServers": {
+        "weather": {
+            "command": "uv",
+            "args": [
+                "--directory",
+                "/Users/vasu/Documents/git/weather",
+                "run",
+                "weather.py"
+            ]
+        }
+    }
+}
