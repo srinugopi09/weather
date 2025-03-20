@@ -6,21 +6,34 @@ import json
 import argparse
 import sys
 import signal
-import sys
 from pathlib import Path
 from typing import Dict, Optional, Any, List
+from enum import Enum
 from contextlib import AsyncExitStack, suppress
-import json
-import sys
 import boto3
-import json
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
+import litellm
+from litellm import completion
 
 
 import anthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+
+class ModelProvider(Enum):
+    """Supported model providers."""
+    ANTHROPIC = "anthropic"
+    BEDROCK = "bedrock"
+
+
+class ModelNames:
+    """Model identifiers for different providers."""
+    CLAUDE3 = os.environ.get("CLAUDE3_MODEL_ID", "claude-3-7-sonnet-20250219")
+    ANTHROPIC = f"anthropic/{CLAUDE3}"
+    BEDROCK = os.environ.get(
+        "BEDROCK_MODEL_ID", "bedrock/us.anthropic.claude-3-7-sonnet-20250219-v1:0")
 
 
 class MCPToolProvider:
@@ -33,6 +46,21 @@ class MCPToolProvider:
         )
         self.sessions = {}
         self.exit_stack = AsyncExitStack()
+        self._shutdown_event = asyncio.Event()
+
+    async def close(self):
+        """Close all connections safely."""
+        self._shutdown_event.set()
+        try:
+            async with asyncio.timeout(5.0):
+                with suppress(asyncio.CancelledError):
+                    await self.exit_stack.aclose()
+        except asyncio.TimeoutError:
+            print("MCP provider cleanup timed out")
+        except Exception as e:
+            print(f"Warning during MCP provider cleanup: {str(e)}")
+        finally:
+            self.sessions.clear()
 
     async def initialize(self):
         """Initialize all configured MCP servers."""
@@ -126,11 +154,15 @@ class MCPToolProvider:
                 if hasattr(tools_result, 'tools'):
                     for tool in tools_result.tools:
                         tool_spec = {
-                            "name": tool.name,
-                            "description": tool.description if hasattr(tool, "description") else "",
-                            "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
-                            "server": server_name  # Add server name to identify where to execute
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": tool.description if hasattr(tool, "description") else "",
+                                "parameters": tool.inputSchema if hasattr(tool, "inputSchema") else {}
+                            }
                         }
+                        # Store server name separately for internal use
+                        tool_spec['_server'] = server_name
                         all_tools.append(tool_spec)
             except Exception as e:
                 print(f"Error getting tools from '{server_name}': {str(e)}")
@@ -152,334 +184,261 @@ class MCPToolProvider:
             raise
 
     async def close(self):
-        """Close all connections."""
-        await self.exit_stack.aclose()
+        """Close all connections safely."""
+        try:
+            # Create a task in the current task group for cleanup
+            async with asyncio.timeout(5.0):  # 5 second timeout for cleanup
+                try:
+                    await self.exit_stack.aclose()
+                except (asyncio.CancelledError, Exception) as e:
+                    print(f"Warning during MCP provider cleanup: {str(e)}")
+        except asyncio.TimeoutError:
+            print("MCP provider cleanup timed out")
+        finally:
+            self.sessions.clear()
 
 
 class LLMProvider:
-    """Provider for LLM services with a pluggable architecture."""
+    """Provider for LLM services with a unified LiteLLM interface."""
 
-    def __init__(self, provider_type="anthropic"):
-        self.provider_type = provider_type
-        self.client = self._initialize_client()
+    def __init__(self, provider_type: str = ModelProvider.ANTHROPIC.value):
+        """Initialize the LLM provider.
 
-    def _initialize_client(self):
-        """Initialize the appropriate LLM client based on provider type."""
-        if self.provider_type == "anthropic":
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-            if not api_key:
-                raise ValueError(
-                    "ANTHROPIC_API_KEY environment variable not set")
-            return anthropic.Anthropic(api_key=api_key)
-        elif self.provider_type == "bedrock":
-            # Placeholder for AWS Bedrock integration
-            return boto3.client(
-                service_name="bedrock-runtime",
-                region_name=os.environ.get("AWS_REGION", "us-east-1")
-            )
-        else:
-            raise ValueError(
-                f"Unsupported provider type: {self.provider_type}")
+        Args:
+            provider_type: The type of provider to use (anthropic or bedrock)
+        """
+        self.provider_type = provider_type.lower()
+        self.model = self._get_model_name()
 
-    async def generate_response(self, messages, tools=None, tool_choice=None):
-        """Generate a response from the LLM."""
-        if self.provider_type == "anthropic":
-            # Use Anthropic's API
-            kwargs = {
-                "model": "claude-3-7-sonnet-20250219",
-                "max_tokens": 1000,
-                "messages": messages
-            }
+        if self.provider_type == ModelProvider.BEDROCK.value:
+            self._setup_bedrock()
 
-            if tools:
-                # Format tools for Anthropic API
-                anthropic_tools = []
-                for tool in tools:
-                    anthropic_tools.append({
-                        "name": tool["name"],
-                        "description": tool["description"],
-                        "input_schema": tool["input_schema"]
-                    })
-                kwargs["tools"] = anthropic_tools
+    def _get_model_name(self) -> str:
+        """Get the appropriate model name for the provider."""
+        if self.provider_type == ModelProvider.ANTHROPIC.value:
+            return ModelNames.ANTHROPIC
+        elif self.provider_type == ModelProvider.BEDROCK.value:
+            return ModelNames.BEDROCK
+        raise ValueError(f"Unsupported provider type: {self.provider_type}")
 
-            return self.client.messages.create(**kwargs)
-        elif self.provider_type == "bedrock":
-            print("Using Bedrock provider")
+    def _setup_bedrock(self) -> None:
+        """Configure Bedrock client for LiteLLM."""
+        import boto3
+        session = boto3.Session(
+            region_name=os.environ.get("AWS_REGION", "us-east-1")
+        )
+        litellm.aws_bedrock_client = session.client(
+            service_name='bedrock-runtime'
+        )
 
-            # Format messages for Claude on Bedrock
-            formatted_messages = []
-            for message in messages:
-                if isinstance(message["content"], str):
-                    formatted_messages.append({
-                        "role": message["role"],
-                        "content": [{"type": "text", "text": message["content"]}]
-                    })
-                else:
-                    # Handle complex content objects
-                    formatted_messages.append({
-                        "role": message["role"],
-                        "content": message["content"]
-                    })
+    async def generate_response(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None
+    ) -> Any:
+        """Generate a response using LiteLLM's unified interface.
 
-            # print(
-            #     f"Formatted messages for Bedrock: {json.dumps(formatted_messages, indent=2)}")
+        Args:
+            messages: The conversation history
+            tools: Optional list of available tools
 
-            # Prepare request payload
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 1000,
-                "messages": formatted_messages
-            }
+        Returns:
+            The LLM response
+        """
+        try:
+            params = self._prepare_request_params(messages, tools)
+            return await litellm.acompletion(**params)
 
-            # Add tools if provided
-            if tools:
-                anthropic_tools = []
-                for tool in tools:
-                    anthropic_tools.append({
-                        "name": tool["name"],
-                        "description": tool["description"],
-                        "input_schema": {
-                            "type": "object",
-                            "properties": tool["input_schema"]["properties"] if "properties" in tool["input_schema"] else {},
-                            "required": tool["input_schema"].get("required", [])
-                        }
-                    })
-                request_body["tools"] = anthropic_tools
-                # print(f"Added {len(anthropic_tools)} tools to request")
+        except Exception as e:
+            print(f"Error calling LLM via LiteLLM: {e}")
+            raise
 
-            # Select the Anthropic model ID based on your preference
-            model_id = os.environ.get(
-                "BEDROCK_MODEL_ID", "anthropic.claude-3-7-sonnet-20250219-v1:0")
-            # print(f"Using Bedrock model ID: {model_id}")
+    def _prepare_request_params(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
+        """Prepare the parameters for the LLM request.
 
-            try:
-                # Invoke the model
-                # print(
-                #     f"Sending request to Bedrock: {json.dumps(request_body, indent=2)}")
-                response = self.client.invoke_model(
-                    modelId=model_id,
-                    body=json.dumps(request_body),
+        Args:
+            messages: The conversation history
+            tools: Optional list of available tools
 
-                )
+        Returns:
+            Dictionary of parameters for the LLM request
+        """
+        params = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": 1000,
+        }
 
-                # Parse the response
-                response_body = json.loads(
-                    response["body"].read().decode("utf-8"))
-                # print(
-                #     f"Received response from Bedrock: {json.dumps(response_body, indent=2)}")
+        if tools:
+            params["tools"] = tools
+            params["tool_choice"] = "auto"
 
-                # Define a class that simulates the Anthropic API response structure
-                # Define a class that directly mimics the Anthropic API response structure
-                class BedrockResponse:
-                    class ContentItem:
-                        def __init__(self, item_data):
-                            self.type = item_data.get("type")
-                            self.text = item_data.get("text", "")
-                            self.id = item_data.get("id", "")
-                            self.name = item_data.get("name", "")
-                            self.input = item_data.get("input", {})
-
-                        def __getitem__(self, key):
-                            return getattr(self, key)
-
-                    def __init__(self, bedrock_data):
-                        self.model = model_id
-                        self.stop_reason = bedrock_data.get("stop_reason")
-                        self.content = []
-
-                        # Process the content
-                        print(f"Processing Bedrock response content")
-                        if "content" in bedrock_data:
-                            for i, item in enumerate(bedrock_data["content"]):
-                                # print(
-                                #     f"Content item {i}: {json.dumps(item, indent=2)}")
-                                # Create ContentItem objects
-                                self.content.append(self.ContentItem(item))
-                                # print(
-                                #     f"Added content item with type: {self.content[-1].type}")
-
-                result = BedrockResponse(response_body)
-                # print(
-                #     f"Created BedrockResponse with {len(result.content)} content items")
-                return result
-
-            except ClientError as e:
-                print(f"Error calling Bedrock: {e}")
-                raise
-            except Exception as e:
-                print(f"Unexpected error with Bedrock: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
-
-    def _format_complex_content(self, content):
-        """Format complex content objects into strings for Bedrock."""
-        if isinstance(content, list):
-            formatted_parts = []
-            for item in content:
-                if item.get("type") == "text":
-                    formatted_parts.append(item["text"])
-                elif item.get("type") == "tool_result":
-                    tool_result = f"Tool result for {item.get('tool_use_id', 'unknown tool')}:\n"
-                    if isinstance(item.get("content"), list):
-                        for content_part in item["content"]:
-                            if content_part.get("type") == "text":
-                                tool_result += content_part["text"]
-                    else:
-                        tool_result += str(item.get("content", ""))
-                    formatted_parts.append(tool_result)
-            return "\n".join(formatted_parts)
-        return str(content)
+        return params
 
 
 class ChatApplication:
     """Main chat application integrating MCP tools with LLM."""
 
-    def __init__(self, config_path=None, model_provider="anthropic"):
+    def __init__(self, config_path: Optional[str] = None, model_provider: str = ModelProvider.ANTHROPIC.value):
         self.mcp_provider = MCPToolProvider(config_path)
         self.llm_provider = LLMProvider(model_provider)
         self.conversation_history = []
+        self._shutdown_event = asyncio.Event()
+
+    async def close(self):
+        """Clean up resources safely."""
+        self._shutdown_event.set()
+
+        if hasattr(self, 'mcp_provider'):
+            await self.mcp_provider.close()
+
+        print("Application cleanup completed.")
 
     async def initialize(self):
         """Initialize the application."""
         await self.mcp_provider.initialize()
 
-    async def process_query(self, query_text):
+    async def process_query(self, query_text: str) -> str:
         """Process a user query using LLM and tools."""
-        # Add user message to history
+        if self._shutdown_event.is_set():
+            raise asyncio.CancelledError("Application is shutting down")
+        try:
+            # Start conversation with user query
+            self._add_to_history("user", query_text)
+
+            # Get available tools
+            tools = await self.mcp_provider.get_available_tools()
+            tool_to_server = {tool["function"]["name"]                              : tool["_server"] for tool in tools}
+
+            # Get initial LLM response
+            response = await self.llm_provider.generate_response(
+                messages=self.conversation_history,
+                tools=tools
+            )
+
+            result = await self._process_llm_response(response, tools, tool_to_server)
+            self._add_to_history("assistant", result)
+
+            return result
+
+        except Exception as e:
+            print(f"\nError processing query: {str(e)}")
+            raise
+
+    def _add_to_history(self, role: str, content: str) -> None:
+        """Add a message to the conversation history."""
         self.conversation_history.append({
-            "role": "user",
-            "content": query_text
+            "role": role,
+            "content": content
         })
 
-        # Get available tools
-        tools = await self.mcp_provider.get_available_tools()
+    async def _process_llm_response(
+        self,
+        response: Any,
+        tools: List[Dict[str, Any]],
+        tool_to_server: Dict[str, str]
+    ) -> str:
+        """Process the LLM response and handle any tool calls."""
+        if not hasattr(response, 'choices') or not response.choices:
+            return "I apologize, but I couldn't generate a proper response."
 
-        # First LLM call to determine tool use
-        response = await self.llm_provider.generate_response(
-            messages=self.conversation_history,
-            tools=tools
-        )
+        choice = response.choices[0]
+        message = choice.message
 
-        result = None
+        # If no tool calls, return the content directly
+        if not (hasattr(message, 'tool_calls') and message.tool_calls):
+            return message.content or "I apologize, but I couldn't generate a proper response."
+
+        # Process tool calls
         tool_calls = []
+        for tool_call in message.tool_calls:
+            tool_results = await self._execute_tool_call(
+                tool_call,
+                tool_to_server
+            )
+            tool_calls.extend(tool_results)
 
-        # Check if the model wants to use a tool
-        for content in response.content:
-            content_type = content.type if hasattr(
-                content, 'type') else content.get('type')
-
-            if content_type == 'text':
-                result = content.text if hasattr(
-                    content, 'text') else content.get('text')
-            elif content_type == 'tool_use':
-                # Track tool usage
-                tool_name = content.name if hasattr(
-                    content, 'name') else content.get('name')
-                tool_args = content.input if hasattr(
-                    content, 'input') else content.get('input')
-                tool_id = content.id if hasattr(
-                    content, 'id') else content.get('id')
-
-                print(f"🔧 Using tool: {tool_name}")
-
-                # Find which server this tool belongs to
-                server_name = None
-                for tool in tools:
-                    if tool["name"] == tool_name:
-                        server_name = tool["server"]
-                        break
-
-                if not server_name:
-                    result = f"Error: Could not determine which server provides tool '{tool_name}'"
-                    break
-
-                try:
-                    # Execute the tool
-                    tool_result = await self.mcp_provider.execute_tool(server_name, tool_name, tool_args)
-
-                    # Format tool result for the next LLM call
-                    tool_calls.append({
-                        "role": "assistant",
-                        "content": [{"type": "tool_use", "id": tool_id, "name": tool_name, "input": tool_args}]
-                    })
-
-                    if hasattr(tool_result, 'content'):
-                        # Handle the case where content is a list of objects
-                        if isinstance(tool_result.content, list):
-                            # Convert to plain string if it's a list of content objects
-                            tool_content = ""
-                            for item in tool_result.content:
-                                if hasattr(item, 'text'):
-                                    tool_content += item.text
-                                elif hasattr(item, 'type') and item.type == 'text':
-                                    tool_content += item.text
-                                else:
-                                    tool_content += str(item)
-                        else:
-                            # Convert to plain string
-                            tool_content = str(tool_result.content)
-                    else:
-                        tool_content = str(tool_result)
-
-                    tool_calls.append({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_id,
-                            "content": tool_content
-                        }]
-                    })
-                except Exception as e:
-                    tool_calls.append({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_id,
-                            "content": f"Error: {str(e)}"
-                        }]
-                    })
-
-        # If tools were used, make a follow-up call with the tool results
+        # Get final response with tool results
         if tool_calls:
-            # Combine original conversation with tool calls
             full_messages = self.conversation_history + tool_calls
-
-            # Make follow-up call
             final_response = await self.llm_provider.generate_response(
                 messages=full_messages,
                 tools=tools
             )
 
-            # Update result with final response
-            for content in final_response.content:
-                content_type = content.type if hasattr(
-                    content, 'type') else content.get('type')
-                if content_type == 'text':
-                    result = content.text if hasattr(
-                        content, 'text') else content.get('text')
-                    break
+            if hasattr(final_response, 'choices') and final_response.choices:
+                final_message = final_response.choices[0].message
+                if hasattr(final_message, 'content'):
+                    return final_message.content
 
-        # Add assistant's response to history
-        self.conversation_history.append({
-            "role": "assistant",
-            "content": result
-        })
+        return "I apologize, but I couldn't process the tool results properly."
 
-        return result
+    async def _execute_tool_call(
+        self,
+        tool_call: Any,
+        tool_to_server: Dict[str, str]
+    ) -> List[Dict[str, Any]]:
+        """Execute a tool call and format the result for the conversation.
 
-    async def close(self):
-        """Clean up resources."""
+        Args:
+            tool_call: The tool call from the LLM
+            tool_to_server: Mapping of tool names to server names
+
+        Returns:
+            List of formatted messages for the conversation
+        """
+        tool_name = tool_call.function.name
+        tool_args = json.loads(tool_call.function.arguments)
+        tool_id = tool_call.id
+
+        print(f"🔧 Using tool: {tool_name}")
+
+        server_name = tool_to_server.get(tool_name)
+        if not server_name:
+            raise ValueError(
+                f"Could not determine which server provides tool '{tool_name}'")
+
         try:
-            if hasattr(self, 'mcp_provider'):
-                await self.mcp_provider.close()
-        except asyncio.CancelledError:
-            # Suppress cancellation during cleanup
-            pass
+            # Execute the tool
+            tool_result = await self.mcp_provider.execute_tool(
+                server_name,
+                tool_name,
+                tool_args
+            )
+
+            # Format the response messages
+            return [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(tool_args)
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "content": str(tool_result),
+                    "tool_call_id": tool_id
+                }
+            ]
+
         except Exception as e:
-            print(f"Error during cleanup: {str(e)}")
-        finally:
-            print("Application cleanup completed.")
+            return [{
+                "role": "tool",
+                "content": f"Error: {str(e)}",
+                "tool_call_id": tool_id
+            }]
+
+# This is a duplicate method definition that should be removed completely
 
 
 async def shutdown(app, signal=None):
@@ -489,23 +448,20 @@ async def shutdown(app, signal=None):
 
     print("Initiating shutdown...")
 
-    # First cleanup the application
-    try:
-        await app.close()
-    except Exception as e:
-        print(f"Error during application cleanup: {e}")
-
-    # Then cancel remaining tasks
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    # Cancel all tasks first except cleanup
+    tasks = [t for t in asyncio.all_tasks()
+             if t is not asyncio.current_task()]
 
     if tasks:
         print(f"Cancelling {len(tasks)} outstanding tasks")
         for task in tasks:
             task.cancel()
 
-        with suppress(asyncio.CancelledError):
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Wait for tasks to complete their cancellation
+        await asyncio.gather(*tasks, return_exceptions=True)
 
+    # Perform simple cleanup
+    await app.close()
     print("Shutdown complete.")
 
 
@@ -554,11 +510,8 @@ async def main_async():
 
     except asyncio.CancelledError:
         pass  # Handled by shutdown
-    except KeyboardInterrupt:
-        await shutdown(app)
     except Exception as e:
         print(f"Error: {str(e)}")
-        await shutdown(app)
 
 
 async def json_mode_main():
@@ -634,7 +587,7 @@ async def json_mode_main():
         }))
         sys.stdout.flush()
     finally:
-        await app.close()
+        pass
 
 
 def main():
