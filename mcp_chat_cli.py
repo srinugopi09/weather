@@ -5,14 +5,17 @@ import asyncio
 import json
 import argparse
 import sys
+import signal
+import sys
 from pathlib import Path
 from typing import Dict, Optional, Any, List
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 import json
 import sys
 import boto3
 import json
 from botocore.exceptions import ClientError
+from dotenv import load_dotenv
 
 
 import anthropic
@@ -467,42 +470,94 @@ class ChatApplication:
 
     async def close(self):
         """Clean up resources."""
-        await self.mcp_provider.close()
+        try:
+            if hasattr(self, 'mcp_provider'):
+                await self.mcp_provider.close()
+        except asyncio.CancelledError:
+            # Suppress cancellation during cleanup
+            pass
+        except Exception as e:
+            print(f"Error during cleanup: {str(e)}")
+        finally:
+            print("Application cleanup completed.")
+
+
+async def shutdown(app, signal=None):
+    """Cleanup tasks tied to the service's shutdown."""
+    if signal:
+        print(f"\nReceived exit signal {signal.name}...")
+    
+    print("Initiating shutdown...")
+    
+    # First cleanup the application
+    try:
+        await app.close()
+    except Exception as e:
+        print(f"Error during application cleanup: {e}")
+    
+    # Then cancel remaining tasks
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    
+    if tasks:
+        print(f"Cancelling {len(tasks)} outstanding tasks")
+        for task in tasks:
+            task.cancel()
+        
+        with suppress(asyncio.CancelledError):
+            await asyncio.gather(*tasks, return_exceptions=True)
+    
+    print("Shutdown complete.")
 
 
 async def main_async():
-    parser = argparse.ArgumentParser(
-        description="MCP-powered chat application")
+    parser = argparse.ArgumentParser(description="MCP-powered chat application")
     parser.add_argument("--config", help="Path to MCP config file")
     parser.add_argument("--model-provider", default="anthropic",
-                        choices=["anthropic", "bedrock"],
-                        help="LLM provider (anthropic, bedrock)")
+                      choices=["anthropic", "bedrock"],
+                      help="LLM provider (anthropic, bedrock)")
     args = parser.parse_args()
-
-    # Create and initialize the application
+    
     app = ChatApplication(args.config, args.model_provider)
-
+    
+    def handle_signal(s):
+        # Create task to run shutdown
+        loop = asyncio.get_running_loop()
+        loop.create_task(shutdown(app, signal=s))
+    
+    # Set up signal handlers
+    loop = asyncio.get_running_loop()
+    signals = (signal.SIGTERM, signal.SIGINT)
+    for s in signals:
+        loop.add_signal_handler(s, lambda s=s: handle_signal(s))
+    
     try:
         print("Initializing MCP servers...")
         await app.initialize()
-
-        print("\n🤖 Welcome to MCP Chat! Type 'exit' to quit.\n")
-
+        
+        print("\n\U0001F916 Welcome to MCP Chat! Type 'exit' to quit.\n")
+        
         while True:
-            user_input = input("You: ")
-            if user_input.lower() in ["exit", "quit"]:
+            try:
+                user_input = input("You: ")
+                if user_input.lower() in ["exit", "quit"]:
+                    break
+                
+                print("\nProcessing...")
+                response = await app.process_query(user_input)
+                print(f"\nAI: {response}\n")
+            except asyncio.CancelledError:
+                print("\nOperation cancelled.")
                 break
-
-            print("\nProcessing...")
-            response = await app.process_query(user_input)
-            print(f"\nAI: {response}\n")
-
+            except Exception as e:
+                print(f"\nError processing query: {str(e)}")
+    
+    except asyncio.CancelledError:
+        pass  # Handled by shutdown
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        await shutdown(app)
     except Exception as e:
         print(f"Error: {str(e)}")
-    finally:
-        await app.close()
+        await shutdown(app)
 
 
 async def json_mode_main():
@@ -583,6 +638,7 @@ async def json_mode_main():
 
 def main():
     """Entry point for the CLI app."""
+    load_dotenv()
     parser = argparse.ArgumentParser(
         description="MCP-powered chat application")
     parser.add_argument("--json-mode", action="store_true",
