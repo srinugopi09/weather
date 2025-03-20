@@ -221,8 +221,8 @@ class LLMProvider:
                         "content": message["content"]
                     })
 
-            print(
-                f"Formatted messages for Bedrock: {json.dumps(formatted_messages, indent=2)}")
+            # print(
+            #     f"Formatted messages for Bedrock: {json.dumps(formatted_messages, indent=2)}")
 
             # Prepare request payload
             request_body = {
@@ -245,17 +245,17 @@ class LLMProvider:
                         }
                     })
                 request_body["tools"] = anthropic_tools
-                print(f"Added {len(anthropic_tools)} tools to request")
+                # print(f"Added {len(anthropic_tools)} tools to request")
 
             # Select the Anthropic model ID based on your preference
             model_id = os.environ.get(
                 "BEDROCK_MODEL_ID", "anthropic.claude-3-7-sonnet-20250219-v1:0")
-            print(f"Using Bedrock model ID: {model_id}")
+            # print(f"Using Bedrock model ID: {model_id}")
 
             try:
                 # Invoke the model
-                print(
-                    f"Sending request to Bedrock: {json.dumps(request_body, indent=2)}")
+                # print(
+                #     f"Sending request to Bedrock: {json.dumps(request_body, indent=2)}")
                 response = self.client.invoke_model(
                     modelId=model_id,
                     body=json.dumps(request_body),
@@ -265,8 +265,8 @@ class LLMProvider:
                 # Parse the response
                 response_body = json.loads(
                     response["body"].read().decode("utf-8"))
-                print(
-                    f"Received response from Bedrock: {json.dumps(response_body, indent=2)}")
+                # print(
+                #     f"Received response from Bedrock: {json.dumps(response_body, indent=2)}")
 
                 # Define a class that simulates the Anthropic API response structure
                 # Define a class that directly mimics the Anthropic API response structure
@@ -291,16 +291,16 @@ class LLMProvider:
                         print(f"Processing Bedrock response content")
                         if "content" in bedrock_data:
                             for i, item in enumerate(bedrock_data["content"]):
-                                print(
-                                    f"Content item {i}: {json.dumps(item, indent=2)}")
+                                # print(
+                                #     f"Content item {i}: {json.dumps(item, indent=2)}")
                                 # Create ContentItem objects
                                 self.content.append(self.ContentItem(item))
-                                print(
-                                    f"Added content item with type: {self.content[-1].type}")
+                                # print(
+                                #     f"Added content item with type: {self.content[-1].type}")
 
                 result = BedrockResponse(response_body)
-                print(
-                    f"Created BedrockResponse with {len(result.content)} content items")
+                # print(
+                #     f"Created BedrockResponse with {len(result.content)} content items")
                 return result
 
             except ClientError as e:
@@ -486,62 +486,63 @@ async def shutdown(app, signal=None):
     """Cleanup tasks tied to the service's shutdown."""
     if signal:
         print(f"\nReceived exit signal {signal.name}...")
-    
+
     print("Initiating shutdown...")
-    
+
     # First cleanup the application
     try:
         await app.close()
     except Exception as e:
         print(f"Error during application cleanup: {e}")
-    
+
     # Then cancel remaining tasks
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    
+
     if tasks:
         print(f"Cancelling {len(tasks)} outstanding tasks")
         for task in tasks:
             task.cancel()
-        
+
         with suppress(asyncio.CancelledError):
             await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     print("Shutdown complete.")
 
 
 async def main_async():
-    parser = argparse.ArgumentParser(description="MCP-powered chat application")
+    parser = argparse.ArgumentParser(
+        description="MCP-powered chat application")
     parser.add_argument("--config", help="Path to MCP config file")
     parser.add_argument("--model-provider", default="anthropic",
-                      choices=["anthropic", "bedrock"],
-                      help="LLM provider (anthropic, bedrock)")
+                        choices=["anthropic", "bedrock"],
+                        help="LLM provider (anthropic, bedrock)")
     args = parser.parse_args()
-    
+
     app = ChatApplication(args.config, args.model_provider)
-    
+
     def handle_signal(s):
         # Create task to run shutdown
         loop = asyncio.get_running_loop()
         loop.create_task(shutdown(app, signal=s))
-    
+
     # Set up signal handlers
     loop = asyncio.get_running_loop()
     signals = (signal.SIGTERM, signal.SIGINT)
     for s in signals:
         loop.add_signal_handler(s, lambda s=s: handle_signal(s))
-    
+
     try:
         print("Initializing MCP servers...")
         await app.initialize()
-        
+
         print("\n\U0001F916 Welcome to MCP Chat! Type 'exit' to quit.\n")
-        
+
         while True:
             try:
                 user_input = input("You: ")
                 if user_input.lower() in ["exit", "quit"]:
                     break
-                
+
                 print("\nProcessing...")
                 response = await app.process_query(user_input)
                 print(f"\nAI: {response}\n")
@@ -550,7 +551,7 @@ async def main_async():
                 break
             except Exception as e:
                 print(f"\nError processing query: {str(e)}")
-    
+
     except asyncio.CancelledError:
         pass  # Handled by shutdown
     except KeyboardInterrupt:
